@@ -5,4 +5,6 @@ SECTIONS {
     .rodata : { *(.rodata*) }
     .data : { *(.data*) }
     .bss : { *(.bss*) *(COMMON) }
+    . = ALIGN(8);
+    _end = .;
 }

@@ -84,6 +84,18 @@ code_\label:            // everything after defcode goes here
   .quad DOCOL   // codeword = DOCOL; .quad cells follow
 .endm
 
+// defvar builds a word that pushes the address of a cell
+.macro defvar name, label, initial=0, flags=0
+  defcode "\name", \label, \flags
+  ldr x0, =var_\label
+  PUSH x0
+  NEXT
+  .data
+  .balign 8
+var_\label:
+  .quad \initial
+.endm
+
 
 // BOOT 
 .global _start
@@ -447,21 +459,138 @@ defcode "bye", BYE
   wfe
   b 1b
 
+// BASE
+defvar "base", BASE, 10
+
+// TYPE: ( addr len -- )
+defcode "type", TYPE
+  POP x4 //len
+  POP x5 //addr
+  cbz x4, 2f
+1:
+  ldrb w0, [x5], #1
+  bl _emit
+  sub x4, x4, #1
+  cbnz x4, 1b
+2:
+  NEXT
+
+// WORD: ( -- addr len )
+defcode "word", WORD
+  bl _word
+  PUSH x0
+  PUSH x1
+  NEXT
+
+// NUMBER: ( addr len -- n unparsed )
+defcode "number", NUMBER
+  POP x1
+  POP x0
+  bl _number
+  PUSH x0
+  PUSH x1
+  NEXT
+
+// State variables
+defvar "state", STATE, 0            // 0 = interpreting, 1 = compiling
+defvar "here", HERE, _end            // next free dict byte
+defvar "latest", LATEST, last_word  // most recently defined header 
+defvar "s0", SZ, data_stack_top     // where an empty data stack points 
+
+// FIND: ( addr len -- header | 0 )
+defcode "find", FIND
+  POP x1
+  POP x0
+  bl _find
+  PUSH x0
+  NEXT
+
+// TCFA: ( header -- xt )
+defcode ">cfa", TCFA
+  POP x0
+  bl _tcfa
+  PUSH x0
+  NEXT
+
+// CREATE: ( addr len -- )
+defcode "create", CREATE
+  POP x1
+  POP x0
+  ldr x2, =var_HERE
+  ldr x3, [x2]            // here -> new header address 
+  ldr x4, =var_LATEST     // latest -> previous header 
+  ldr x5, [x4]
+  str x5, [x3]            // link field = previous header 
+  strb w1, [x3, #8]       // len byte 
+  add x6, x3, #9          // name begins here
+ 1:
+  ldrb w7, [x0], #1         // read a name char, advance the token pointer
+  strb w7, [x6], #1         // write it into the header, advance the write pointer
+  sub  x1, x1, #1
+  cbnz x1, 1b
+  add  x6, x6, #7
+  and  x6, x6, #~7          // align up — same idiom as _tcfa
+  str  x6, [x2]             // here   = aligned end of the name   (value → address in x2)
+  str  x3, [x4]             // latest = the new header            (value → address in x4)
+  NEXT 
+defcode ",", COMMA
+  POP  x0
+  ldr  x1, =var_HERE
+  ldr  x2, [x1]
+  str  x0, [x2], #8       // store at here, advance one cell
+  str  x2, [x1]            // write the advanced pointer back
+  NEXT
+
+defcode "[", LBRAC, F_IMMED
+  ldr  x0, =var_STATE
+  mov  x1, #0
+  str  x1, [x0]
+  NEXT
+
+defcode "]", RBRAC
+  ldr  x0, =var_STATE
+  mov  x1, #1
+  str  x1, [x0]
+  NEXT
+
+defcode "immediate", IMMEDIATE, F_IMMED
+  ldr  x0, =var_LATEST
+  ldr  x0, [x0]             // only the value needed here — no write-back of latest itself
+  ldrb w1, [x0, #8]
+  eor  w1, w1, #F_IMMED
+  strb w1, [x0, #8]
+  NEXT
+
+defcode "hidden", HIDDEN    // ( header -- )
+  POP  x0
+  ldrb w1, [x0, #8]
+  eor  w1, w1, #F_HIDDEN
+  strb w1, [x0, #8]
+  NEXT
+
+defword ":", COLON
+  .quad WORD, CREATE        // ( -- addr len ) ( addr len -- )
+  .quad LIT, DOCOL, COMMA     // compile the codeword that runs colon words
+  .quad LATEST, FETCH, HIDDEN
+  .quad RBRAC                 // enter compile mode
+  .quad EXIT
+
+defword ";", SEMICOLON, F_IMMED
+  .quad LIT, EXIT, COMMA     // compile the word every colon word ends with
+  .quad LATEST, FETCH, HIDDEN
+  .quad LBRAC                 // back to interpreting
+  .quad EXIT
+// -------- must stay after the LAST word defined in assembly --------
+.set last_word, link
 
 // Test 
 .data
-.balign 8 
+.balign 8
 test:
-  .quad LIT, 6, LIT, 7, MUL, DOT            // 42
-  .quad LIT, 100, LIT, 7, DIVMOD, DOT, DOT  // 14 2
-  .quad LIT, -5, LIT, 3, SUB, DOT           // -8
-  .quad LIT, 1, LIT, 2, SWAP, DOT, DOT      // 1 2
-  .quad LIT, 3, LIT, 3, EQU, DOT            // -1
-  .quad LIT, 0, ZBRANCH, 32, LIT, 78, EMIT  // branch taken: no "N"
-  .quad LIT, 1, ZBRANCH, 32, LIT, 89, EMIT  // falls through: "Y"
-  .quad LIT, 10, EMIT
-  .quad BYE
-
+  .quad WORD, FIND          // ( -- header|0 )
+  .quad QDUPE, ZBRANCH, 24  // 0 → loop
+  .quad TCFA, EXECUTE       // ( header -- xt ) ( xt -- )
+  .quad BRANCH, -64 
 
 // UART Helpers 
 .text
@@ -533,6 +662,136 @@ _print_num:
   ret
 .ltorg 
 
+// _word: read the next whitespace-delimited token into word_buffer. 
+// Returns x0 = address, x1 = length. 
+_word:
+  stp x29, x30, [sp, #-16]!
+
+// Skip leading whitespace
+1:
+  bl _key               // next char -> w0
+  cmp w0, #'\\'         // backslash?
+  b.eq 3f               // yes? go skip the comment
+  cmp w0, #' '
+  b.ls 1b               // loop if still whitespace 
+
+  ldr x4, =word_buffer  // write pointer = start of buffer
+
+// Collect the token
+2:
+  strb w0, [x4], #1
+  bl _key
+  cmp w0, #' '
+  b.hi 2b               // char > space -> part of the token
+
+  ldr x0, =word_buffer
+  sub x1, x4, x0        // length = write pointer - start
+  ldp x29, x30, [sp], #16 
+  ret
+
+3:                      // backslash comment
+  bl _key
+  cmp w0, #10           // LF?
+  b.ne 3b               // not yet, keep looping
+  b 1b                  // back to whitespace skipping
+  
+// _number: given addr in x0 and len in x1, walk the characters
+// and build the value digit by digit
+_number:
+  mov x2, x0                // move address to read pointer
+  mov x3, #0                // initialize accumulator (x3) to 0
+  mov x6, #0                // initialize negative flag (x6) to 0
+  ldr x4, =var_BASE         // address of the base cell
+  ldr x4, [x4]              // value at that address
+  cbz x1, 9f                // empty token -> value 0, unparsed 0
+
+// leading minus check
+  ldrb w5, [x2]             // peek first character
+  cmp w5, #'-'
+  b.ne 1f                   // not a minus, go straight to the number loop
+  mov x6, #1                // set the negative flag
+  add x2, x2, #1            // advance the read pointer past the '-'
+  sub x1, x1, #1            // decrement the length 
+  cbnz x1, 1f               // more chars -> number loop 
+  mov x1, #1                // bare '-': not a number, report 1 unparsed
+  b 9f
+
+// number loop
+1:
+  ldrb w5, [x2], #1
+  sub w5, w5, #'0'
+  cmp w5, #10
+  b.lo 2f                   // 0-9 -> it's a digit, check against base
+  sub w5, w5, #('A' - '0')
+  cmp w5, #26
+  b.lo 4f                   // A-Z -> add 10 below
+  sub w5, w5, #('a' - 'A')
+  cmp w5, #26
+  b.hs 8f                   // not a-z, stop parsing
+4:
+  add w5, w5, #10           // letters are digits 10..35
+2:
+  cmp x5, x4                // digit vs base 
+  b.hs 8f                   // digit >= base, stop parsing
+  madd x3, x3, x4, x5       // accumulator = accumulator * base + digit 
+  sub x1, x1, #1            // one more char consumed
+  cbnz x1, 1b               // more left -> loop again
+
+// Finish
+8:
+  cbz x6, 9f                // flag clear -> skip negate 
+  neg x3, x3
+9:
+  mov x0, x3
+  ret
+
+// _find: takes the token word left, leaves the header
+// address if a word by that name exists, or 0 
+// ---- REGISTERS ----
+// x2 -- current header
+// w3 -- that header's len|flags byte, masked
+// x4 -- pointer into the header's name
+// x5 -- pointer into the token
+// x6 -- chars left to compare
+// w7, w8 -- one char from each
+_find:
+  ldr x2, =var_LATEST
+  ldr x2, [x2]
+1:
+  cbz x2, 4f                // link of 0 means end of chain and header not found
+  ldrb w3, [x2, #8]         // len | flags byte
+  and w3, w3, #(F_HIDDEN | F_LENMASK)
+  cmp x3, x1                // same length as token?
+  b.ne 3f                   // no? next header 
+  add x4, x2, #9            // name starts after link(8) + len (1)
+  mov x5, x0                // token pointer 
+  mov x6, x1                // count 
+2:
+  ldrb w7, [x4], #1 
+  ldrb w8, [x5], #1 
+  cmp w7, w8
+  b.ne 3f                   // token mismatch -> next header 
+  sub x6, x6, #1 
+  cbnz x6, 2b
+  mov x0, x2                // every char matched -> return this header 
+  ret
+3:
+  ldr x2, [x2]              // follow the link to the previous header 
+  b 1b
+4:
+  mov x0, #0
+  ret
+
+// _tcfa: converts a header address into an execution token 
+_tcfa:
+  ldrb w1, [x0, #8]
+  and w1, w1, #F_LENMASK
+  add x0, x0, #9          // past link + len byte
+  add x0, x0, x1          // past the name 
+  add x0, x0, #7 
+  and x0, x0, #~7         // round up to a multiple of 8
+  ret
+
 // The three stacks 
 .bss 
 .balign 16 
@@ -542,3 +801,5 @@ machine_stack_top:    // sp starts here
 data_stack_top:
   .space 8192         // x21 starts here 
 return_stack_top:     // x22 starts here 
+word_buffer:
+  .space 32
