@@ -108,7 +108,7 @@ _start:
   ldr x22, =return_stack_top 
 
   // point IP at test program (below) and start the machine 
-  ldr x19, =test 
+  ldr x19, =cold_start 
   NEXT
 
 // Inner Interpreter
@@ -580,6 +580,66 @@ defword ";", SEMICOLON, F_IMMED
   .quad LATEST, FETCH, HIDDEN
   .quad LBRAC                 // back to interpreting
   .quad EXIT
+
+defcode "interpret", INTERPRET 
+  bl _word
+  mov x9, x0 
+  mov x10, x1
+  bl _find
+  cbz x0, 2f
+
+  ldrb w11, [x0, #8]
+  bl _tcfa
+  tst w11, #F_IMMED
+  b.ne 1f
+  ldr x1, =var_STATE
+  ldr x1, [x1]
+  cbz x1, 1f
+  ldr x1, =var_HERE
+  ldr x2, [x1]
+  str x0, [x2], #8
+  str x2, [x1]
+  NEXT
+1:
+  mov x20, x0
+  ldr x0, [x20]
+  br x0
+2:
+  mov x0, x9
+  mov x1, x10
+  bl _number
+  cbnz x1, 4f
+  ldr x1, =var_STATE
+  ldr x1, [x1]
+  cbz x1, 3f
+  ldr x1, =var_HERE
+  ldr x2, [x1]
+  ldr x3, =LIT
+  str x3, [x2], #8
+  str x0, [x2], #8
+  str x2, [x1]
+  NEXT
+3:
+  PUSH x0
+  NEXT
+4:
+  ldrb w0, [x9], #1
+  bl _emit
+  sub x10, x10, #1
+  cbnz x10, 4b
+  mov w0, #' '
+  bl _emit
+  mov w0, #'?'
+  bl _emit
+  mov w0, #10
+  bl _emit
+  NEXT
+
+defword "quit", QUIT
+  .quad LIT, return_stack_top, RSPSTORE
+  .quad INTERPRET
+  .quad BRANCH, -16
+
 // -------- must stay after the LAST word defined in assembly --------
 .set last_word, link
 
@@ -591,6 +651,9 @@ test:
   .quad QDUPE, ZBRANCH, 24  // 0 → loop
   .quad TCFA, EXECUTE       // ( header -- xt ) ( xt -- )
   .quad BRANCH, -64 
+
+cold_start:
+  .quad QUIT
 
 // UART Helpers 
 .text
