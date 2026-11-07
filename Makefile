@@ -11,7 +11,7 @@ AS   = $(CROSS)as
 LD   = $(CROSS)ld
 QEMU = qemu-system-aarch64 -M virt -cpu cortex-a72 -nographic -kernel forth.elf
 
-forth.elf: forth.S link.ld
+forth.elf: forth.S link.ld forth/core.fs
 	$(AS) -g forth.S -o forth.o
 	$(LD) -T link.ld forth.o -o forth.elf
 

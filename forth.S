@@ -96,6 +96,13 @@ var_\label:
   .quad \initial
 .endm
 
+// defconst constant value
+.macro defconst name, label, value, flags=0
+  defcode "\name", \label, \flags
+  ldr x0, =\value
+  PUSH x0
+  NEXT
+.endm
 
 // BOOT 
 .global _start
@@ -261,6 +268,14 @@ defcode ">=", GE
   cmp x1, x0
   csetm x1, ge
   str x1, [x21]
+  NEXT
+
+// EQZERO: ( n -- flag )
+defcode "0=", EQZERO
+  ldr x0, [x21]
+  cmp x0, #0
+  csetm x0, eq
+  str x0, [x21]
   NEXT
 
 // DROP: ( a -- )
@@ -640,6 +655,26 @@ defword "quit", QUIT
   .quad INTERPRET
   .quad BRANCH, -16
 
+defcode "'", TICK
+  ldr x0, [x19], #8
+  PUSH x0
+  NEXT
+
+defcode "litstring", LITSTRING
+  ldr x0, [x19], #8
+  PUSH x19
+  PUSH x0
+  add x19, x19, x0
+  add x19, x19, #7
+  and x19, x19, #~7
+  NEXT
+
+defconst "docol", __DOCOL, DOCOL
+defconst "r0", RZ, return_stack_top
+defconst "f_immed", __F_IMMED, F_IMMED
+defconst "f_hidden", __F_HIDDEN, F_HIDDEN
+defconst "f_lenmask", __F_LENMASK, F_LENMASK
+
 // -------- must stay after the LAST word defined in assembly --------
 .set last_word, link
 
@@ -654,6 +689,16 @@ test:
 
 cold_start:
   .quad QUIT
+
+// Bootstrap source: forth/core.fs is baked into the image here.
+// _key reads these bytes first (no echo), then switches to the UART.
+input_ptr:
+  .quad core_fs_start       // where _key currently is in core.fs
+
+.section .rodata
+core_fs_start:
+  .incbin "forth/core.fs"   // the file's bytes, verbatim
+core_fs_end:
 
 // UART Helpers 
 .text
@@ -677,10 +722,21 @@ _emit:
   str w0, [x1, #UART_DR]    // send the character 
   ret 
 
-// _key: wait for a char, echo it, return it in w0
+// _key: next input char in w0 -- from the embedded core.fs first, then the UART (echoed)
 _key:
     stp  x29, x30, [sp, #-16]!
-    ldr  x1, =UART_BASE
+    // Bootstrap source first: hand out bytes of core.fs until it's exhausted
+    ldr  x1, =input_ptr
+    ldr  x2, [x1]               // x2 = current position in core.fs
+    ldr  x3, =core_fs_end
+    cmp  x2, x3
+    b.hs 3f                     // past the end -> read the UART instead
+    ldrb w0, [x2], #1           // next byte, advance
+    str  x2, [x1]               // save the position
+    ldp  x29, x30, [sp], #16
+    ret                         // no echo for the embedded source
+    // Interactive: block on the UART, echo what we get
+3:  ldr  x1, =UART_BASE
 1:  ldr  w2, [x1, #UART_FR]
     tst  w2, #FR_RXFE           // receive FIFO empty?
     b.ne 1b                     // yes: wait
